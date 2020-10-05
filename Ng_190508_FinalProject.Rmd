@@ -1,0 +1,583 @@
+---
+title: "PSYC496 Final Project"
+output: html_notebook
+---
+
+### Effects of removing outliers on statistical significance
+### Gavin Ng
+### (A joint project with Rachel Flood Heaton)
+
+## Introduction
+The main aim of this project was to examine the effects of different outlier removal procedures. 
+We are interested in the following question: given the same dataset, will different outlier removal procedures lead to differences in the false positive rates? Importantly, will certain procedures lead to an inflation in the false positive rate?
+
+We will examine this in the context of reaction time data. Palmer, Horowitz, Torralba, & Wolfe (2011) reported that reaction time data are best characterized by Ex-Gaussian, Gamma, or Ex-Wald distributions. However, we had difficulty generating Ex-Wald distributions. Our analyses will thus focus on the former two distributions, as well as the normal distribution since many types of data are thought to be normally distributed.
+
+For each distribution, we will first generate data with known parameters (mean, sd, rate, etc.). We then look at the effect of removing outliers at the subject level (i.e. by removing all the data from outlier subjects) and at the trial level (i.e. removing specific outlier trials). The cutoff will be 2.5 standard deviations away (both above and below) from the group mean (for removing at the subject level) or the subject mean (for removing at the trial level) of each condition. 
+
+We will look at two scenarios. First, when there is no effect. Second, when there is an effect, and the study is powered at 80%.
+
+## Some functions
+
+Let's first load the required libraries
+```{r results="hide"}
+library(tidyverse)
+library(statmod)
+library(gamlss.dist)
+library(FAdist)
+```
+
+
+We first create a function to generate a single experiment. We can specify the number of trials per condition, the number of participants per group, and the type of distribution. 
+
+Parameters are hard-coded, and are based on Palmer, et al. (2011; feature search with set size 18).
+
+This function takes in:  
+- The number of trials per subject  
+- The number of subjects per group  
+- The type of distribution  
+- The "effect" parameter  
+
+Note here that the "effect" does not strictly refer to effect size. Depending on the type of distribution, different parameters are used. The "effect" parameter was determined by trial and error to achieve 80% power (since I have no idea how to calculate this for Gamma and Ex-Gaussian distributions)
+
+```{r}
+generate_single_expt <- function(n_trials, n_per_group, distribution, d=0){
+  
+  
+  # generate data for two groups
+  
+  if(distribution == "normal"){
+    group_1 <- data.frame(replicate(n_trials, rnorm(n_per_group), simplify = FALSE), group = 1) 
+    group_2 <- data.frame(replicate(n_trials, rnorm(n_per_group, d), simplify = FALSE), group = 2)
+    
+  } else if (distribution == "exgaussian"){
+    group_1 <- data.frame(replicate(n_trials, rexGAUS(n_per_group, mu = 320, sigma = 30, nu = 90), simplify = FALSE), group = 1) 
+    group_2 <- data.frame(replicate(n_trials, rexGAUS(n_per_group, mu = 320+d, sigma = 30, nu = 90), simplify = FALSE), group = 2)
+  
+
+  } else if (distribution == "gamma"){
+    group_1 <- data.frame(replicate(n_trials, rgamma3(n_per_group, shape = 3, scale = 60, thres =  250), simplify = FALSE), group = 1) 
+    group_2 <- data.frame(replicate(n_trials, rgamma3(n_per_group, shape = 3, scale = 60, thres = 250+d), simplify = FALSE), group = 2)
+
+    
+  }
+  
+
+  # rename columns
+  colnames(group_1) <- c(as.character(seq(n_trials)), "group")
+  
+  # add subject number column
+  group_1$subject <- seq.int(n_per_group)
+  
+  # convert from wide to long
+  group_1 <- group_1 %>%
+    gather(trial, x, 1:n_trials)
+
+  # calculate subject mean and sd
+  group_1_subject_means <- group_1 %>%
+    group_by(subject) %>%
+    summarise(subject_mean = mean(x), subject_se = sd(x))
+  
+  group_1 <- merge(group_1, group_1_subject_means)
+  
+  # calculate group mean and sd
+  group_1$group_mean <- mean(group_1_subject_means$subject_mean)
+  group_1$group_se <- sd(group_1_subject_means$subject_mean)
+  
+  
+  
+  ## Do the same for group 2
+  
+  # rename columns
+  colnames(group_2) <- c(as.character(seq(n_trials)), "group")
+  
+  # add subject number column
+  group_2$subject <- seq.int(n_per_group)
+  
+  # convert from wide to long
+  group_2 <- group_2 %>%
+    gather(trial, x, 1:n_trials)
+  
+  # calculate subject mean and sd
+  group_2_subject_means <- group_2 %>%
+    group_by(subject) %>%
+    summarise(subject_mean = mean(x), subject_se = sd(x))
+  
+  group_2 <- merge(group_2, group_2_subject_means)
+  
+  # calculate group mean and sd
+  group_2$group_mean <- mean(group_2_subject_means$subject_mean)
+  group_2$group_se <- sd(group_2_subject_means$subject_mean)
+  
+
+  
+  out <- rbind(group_1, group_2)
+  
+
+  return(out)
+  
+  
+  
+}
+
+
+
+```
+
+Next, we have a function that generates some data by running the "experiment". This function takes in the:  
+- number of simulations ("experiments" to run)  
+- and the other parameters for the "generate_experiment" function  
+
+
+
+```{r}
+generate_data <- function(n_simulations, n_trials, n_per_group, distribution, d = 0){
+  
+
+  df <- do.call(rbind, replicate(n_simulations,
+                                 cbind(generate_single_expt(n_trials, n_per_group, distribution, d)),
+                                 simplify = FALSE))
+  
+  # add simulation number column
+  df$simulation <- sort(rep(seq(1:n_simulations), n_trials * n_per_group * 2))
+
+  
+  return(df)
+  
+  
+}
+```
+
+Now that we have functions to generate data, let's have another function to remove outliers. This function takes in :  
+- the data,   
+- the cutoff (in terms of SDs),   
+- whether we want to remove upper outliers only, lower outliers only, or both,  
+- whether we want to do it by removing subjects, trials, or both.  
+
+
+
+```{r}
+remove_by_sd <- function(df, cutoff, upper = TRUE, lower = TRUE, by){
+  
+  # Function to remove by subjects
+  by_sub <- function(df, cutoff, upper, lower){
+    
+    clean_df <- df
+    
+    if (upper == TRUE){
+      clean_df <- clean_df %>%
+        filter(subject_mean < (group_mean + (cutoff * group_se)))
+    }
+    
+    if (lower == TRUE){
+      clean_df <- clean_df %>%
+        filter(subject_mean > (group_mean - (cutoff * group_se)))
+    }
+    
+    return(clean_df)
+  }
+  
+  # Function to remove by trials
+  by_trial <- function(df, cutoff, upper, lower){
+    clean_df <- df
+    if (upper == TRUE){
+      
+      clean_df <- clean_df %>%
+        filter(x < (subject_mean + (cutoff * subject_se)))
+    }
+    
+    if (lower == TRUE){
+      clean_df <- clean_df %>%
+        filter(x > (subject_mean - (cutoff * subject_se)))
+      
+    }
+    return(clean_df)
+  }
+  
+  ## MAIN 
+  
+  # Call relevant function(s) depending on options
+  
+  if (by == "subject"){
+    
+    
+    out_df <- by_sub(df, cutoff, upper, lower)
+    
+   
+  } else if (by == "trial"){
+    
+    out_df <- by_trial(df, cutoff, upper, lower)
+    
+  } else if (by == "both"){
+    
+    out_df <- by_sub(df, cutoff, upper, lower)
+    out_df <- by_trial(out_df, cutoff, upper, lower)
+    
+    
+  }
+  
+  return(out_df)
+
+}
+
+```
+
+
+Next is a function that run t-tests on the cleaned data
+
+```{r}
+t_tests <- function(df){
+  
+  # get subject means by group and simulation 
+  test_df <- df %>%
+    group_by(group, subject, simulation) %>%
+    summarise(mean = mean(x))
+  
+  n_simulations <- unique(df$simulation)
+  
+  # prepare matrix for storing p values for output
+  p_matrix <- matrix(NA, nrow=length(n_simulations), ncol=2)
+  
+  # loop through each simulation
+  # what is a faster way to do this??
+  for(i in n_simulations){
+
+    g1 <- (test_df %>% filter(group == 1 & simulation == i))$mean
+    g2 <- (test_df %>% filter(group == 2 & simulation == i))$mean
+
+    p <- (t.test(g1, g2))$p.value
+
+    p_matrix[i,] <- c(i, p)
+    colnames(p_matrix) <- c("simulation", "p.value")
+
+  }
+  
+
+  return(data.frame(p_matrix))
+
+}
+```
+
+Let's also have a function to get the means and sd after outlier removal
+```{r}
+clean_descriptives <- function(cleaned_data, original_data, simulation_results){
+  
+  # get the simulations that returned significant results
+  sig_sims <- (simulation_results %>% filter(p.value <.05))$simulation
+  
+  # get the data that corresponds to these simulations
+  sig_df <- cleaned_data %>%
+    filter(is.element(simulation, sig_sims)) %>%
+    group_by(subject, group, simulation) %>% 
+    summarise(cleaned_mean = mean(x)) %>%
+    mutate(tag = paste(simulation, subject, group, sep = "_"))
+
+  original_df <- original_data %>%
+    filter(is.element(simulation, sig_sims)) %>%
+    group_by(subject, group, simulation) %>%
+    summarise(cleaned_mean = mean(x)) %>%
+    mutate(tag = paste(simulation, subject, group, sep = "_")) %>%
+    filter(is.element(tag, sig_df$tag))
+  
+  
+  
+  return(sig_df)
+}
+```
+
+
+```{r}
+aa <- clean_descriptives(df_cleaned_by_subject, df_normal, t_test_subject)
+```
+
+Lastly, we have a function to plot the distribution of p-values
+
+```{r}
+
+plot_data <- function(df, alpha, title){
+  
+  percent_significant <- sum(df$p.value < alpha) / nrow(df) * 100
+  
+  graph = hist(df$p.value, breaks=c(seq(0,1, 0.01)), plot=FALSE)
+  graph$density = graph$counts/(as.numeric(nrow(df))/100)
+  plot(graph, freq=FALSE, abline(h=1,col='red', lwd=3), 
+       col=c(rep('#15c0ab', 5), rep('#eeeeee',95)), 
+       sub=paste('% significant = ', percent_significant),
+       main=title,
+       xlab = "p value")
+ 
+}
+
+
+```
+
+Now that we have our functions, let's do some simulations!
+
+Let's first set the seed (for reproducibility)
+```{r}
+set.seed(99999)
+```
+
+
+# Simulation 1 - No effect
+
+In the first set of simulations, we will look at the case where there is no effect between the two conditions. 
+
+## Normal distribution
+
+Let's first simulate data from a normal distribution, with 1000 simulations, 30 trials per condition, and 30 participants per group.
+
+
+```{r}
+
+df_normal <- generate_data(n_simulations = 1000,
+                    n_trials = 30,
+                    n_per_group = 30,
+                    distribution = "normal",
+                    d = 0)
+```
+
+Create three dataframes to represent the three ways of cleaning data. Let's use a 2.5 SD cutoff in both directions, which is fairly typical. We do this by subject, by trial, and by both subject and trial.
+
+```{r}
+df_cleaned_by_subject <- remove_by_sd(df_normal, 2.5, by = "subject")
+df_cleaned_by_trial <- remove_by_sd(df_normal, 2.5, by = "trial")
+df_cleaned_by_both <- remove_by_sd(df_normal, 2.5, by = "both")
+```
+
+Let's run the t-tests for each outlier removal method, as well as for the original dataset
+```{r}
+t_test_subject <- t_tests(df_cleaned_by_subject)
+t_test_trial <- t_tests(df_cleaned_by_trial)
+t_test_both <- t_tests(df_cleaned_by_both)
+t_test_normal <- t_tests(df_normal)
+```
+
+Let's take a look at the results of the simulation!
+
+```{r}
+plot_data(t_test_subject, .05, "Subject Level Removal")
+plot_data(t_test_trial, .05, "Trial Level Removal")
+plot_data(t_test_both, .05, "Both")
+plot_data(t_test_normal, .05, "Original Data")
+
+```
+
+It seems that removing outliers by subjects increases the false positive rate to about 7.2`%, while removing outliers at the trial level does not seem to affect the false positive rate. 
+
+## Ex-Gaussian Distribution
+
+Now, let's take a look at the Ex-Gaussian distribution. The Ex-Gaussian distribution is the convolution of an exponential (Ex) and a Gaussian distribution. The parameters we used here are taken from Palmer et al. (2011). The mean and the standard deviation of the Gaussian are 320 and 30 respectively, while the exponential parameter is 90. These parameters have previously been defined when we created the function.
+
+Let's first simulate data from a normal distribution, with 1000 simulations, 30 trials per condition, and 30 participants per group. We then go through the same process as we did with the normal distribution.
+```{r}
+df_exgauss <- generate_data(n_simulations = 1000,
+                    n_trials = 30,
+                    n_per_group = 30,
+                    distribution = "exgaussian",
+                    d = 0)
+```
+
+
+```{r}
+df_cleaned_by_subject <- remove_by_sd(df_exgauss, 2.5, by = "subject")
+df_cleaned_by_trial <- remove_by_sd(df_exgauss, 2.5, by = "trial")
+df_cleaned_by_both <- remove_by_sd(df_exgauss, 2.5, by = "both")
+```
+
+Let's run the t-tests for each outlier removal method, as well as for the original dataset
+```{r}
+t_test_subject <- t_tests(df_cleaned_by_subject)
+t_test_trial <- t_tests(df_cleaned_by_trial)
+t_test_both <- t_tests(df_cleaned_by_both)
+t_test_normal <- t_tests(df_exgauss)
+```
+
+Let's look at the plots!
+```{r}
+plot_data(t_test_subject, .05, "Subject Level Removal")
+plot_data(t_test_trial, .05, "Trial Level Removal")
+plot_data(t_test_both, .05, "Both")
+plot_data(t_test_normal, .05, "Original Data")
+
+
+```
+
+
+Just like in the normal distribution, we see an increase in false positives when we remove outliers by subject. The false positive rate is inflated to 6.1%.
+
+## Gamma Distribution
+
+Next, we will take a look at the Gamma distribution. The Gamma distribution is the sum of a series of exponential functions, each with a different scale. The average scale is represented by the parameter alpha, which in our simulations is 60. The number of exponential processes contributing to the distribution is represented by beta, which we set to 3. Lastly, the shift parameter is set to 240. This represents the shifting of the distribution along the x-axis, and is independent of the other parameters.
+
+Let's first simulate data from a normal distribution, with 1000 simulations, 30 trials per condition, and 30 participants per group. The rest of the processes will be as above.
+```{r}
+df_gamma<- generate_data(n_simulations = 1000,
+                    n_trials = 30,
+                    n_per_group = 30,
+                    distribution = "gamma",
+                    d = 0)
+```
+
+
+```{r}
+df_cleaned_by_subject <- remove_by_sd(df_gamma, 2.5, by = "subject")
+df_cleaned_by_trial <- remove_by_sd(df_gamma, 2.5, by = "trial")
+df_cleaned_by_both <- remove_by_sd(df_gamma, 2.5, by = "both")
+```
+
+```{r}
+t_test_subject <- t_tests(df_cleaned_by_subject)
+t_test_trial <- t_tests(df_cleaned_by_trial)
+t_test_both <- t_tests(df_cleaned_by_both)
+t_test_normal <- t_tests(df_gamma)
+```
+Let's look at the plots!
+```{r}
+plot_data(t_test_subject, .05, "Subject Level Removal")
+plot_data(t_test_trial, .05, "Trial Level Removal")
+plot_data(t_test_both, .05, "Both")
+plot_data(t_test_normal, .05, "Original Data")
+
+```
+
+Again, removing outliers at the subject level inflates the false positive rate to 8.6%. Although this is numerically higher compared to the normal distribution, this is probably noise since the false positive rate for the original data is 6.4%
+
+## Discussion
+
+Across the three different types of distributions (Normal, Ex-Gaussian, and Gamma), we observed that removing outliers at the subject level inflates the false-positive rate. Although this increase is minimal, it is still a worrying phenomenon. On the other hand, removing outliers at the trial level did not seem to affect the false positive rate. 
+
+In the next simulation, we looked at what happens when we simulate experiments that have about 80% power. 
+
+# Simulation 2 - 80% power
+
+## Normal distribution
+
+Let's first simulate data from a normal distribution, with 1000 simulations, 30 trials per condition, and 30 participants per group. We then apply the same outlier removal criteria as before.
+```{r}
+df_normal <- generate_data(n_simulations = 1000,
+                    n_trials = 30,
+                    n_per_group = 30,
+                    distribution = "normal",
+                    d = 0.135)
+```
+
+
+```{r}
+df_cleaned_by_subject <- remove_by_sd(df_normal, 2.5, by = "subject")
+df_cleaned_by_trial <- remove_by_sd(df_normal, 2.5, by = "trial")
+df_cleaned_by_both <- remove_by_sd(df_normal, 2.5, by = "both")
+```
+
+```{r}
+t_test_subject <- t_tests(df_cleaned_by_subject)
+t_test_trial <- t_tests(df_cleaned_by_trial)
+t_test_both <- t_tests(df_cleaned_by_both)
+t_test_normal <- t_tests(df_normal)
+```
+
+Let's look at the plots!
+```{r}
+plot_data(t_test_subject, .05, "Subject Level Removal")
+plot_data(t_test_trial, .05, "Trial Level Removal")
+plot_data(t_test_both, .05, "Both")
+plot_data(t_test_normal, .05, "Original Data")
+
+```
+
+It appears, when there is an effect, removing outliers at the subject level increases the likelihood of obtaining statistical significance, although this increase is very minimal. Interestingly, it appears that removing outliers at the trial level decreases the likelihood of obtaining statistical significance.
+
+What about for the other distributions?
+
+## ExGauss Distribution
+
+Let's look at the Ex-Gaussian distribution, with 1000 simulations, 30 trials per condition, and 30 participants per group.
+```{r}
+df_exgauss<- generate_data(n_simulations = 1000,
+                    n_trials = 30,
+                    n_per_group = 30,
+                    distribution = "exgaussian",
+                    d = 30)
+```
+
+
+```{r}
+df_cleaned_by_subject <- remove_by_sd(df_gamma, 2.5, by = "subject")
+df_cleaned_by_trial <- remove_by_sd(df_gamma, 2.5, by = "trial")
+df_cleaned_by_both <- remove_by_sd(df_gamma, 2.5, by = "both")
+```
+
+```{r}
+t_test_subject <- t_tests(df_cleaned_by_subject)
+t_test_trial <- t_tests(df_cleaned_by_trial)
+t_test_both <- t_tests(df_cleaned_by_both)
+t_test_normal <- t_tests(df_gamma)
+```
+
+Let's look at the plots!
+```{r}
+plot_data(t_test_subject, .05, "Subject Level Removal")
+plot_data(t_test_trial, .05, "Trial Level Removal")
+plot_data(t_test_both, .05, "Both")
+plot_data(t_test_normal, .05, "Original Data")
+
+```
+
+Now, there is a slight increase in the likelihood of obtaining statistical significance when we remove outliers at the subject level. Interestingly, removing outliers at the trial level decreases this likelihood, just like in the Normal distribution. 
+
+What about the Gamma distribution?
+
+## Gamma Distribution
+
+Let's look at the Gamma distribution with 1000 simulations, 30 trials per condition, and 30 participants per group.
+```{r}
+df_gamma<- generate_data(n_simulations = 1000,
+                    n_trials = 30,
+                    n_per_group = 30,
+                    distribution = "gamma",
+                    d = 14)
+```
+
+
+```{r}
+df_cleaned_by_subject <- remove_by_sd(df_gamma, 2.5, by = "subject")
+df_cleaned_by_trial <- remove_by_sd(df_gamma, 2.5, by = "trial")
+df_cleaned_by_both <- remove_by_sd(df_gamma, 2.5, by = "both")
+```
+
+```{r}
+t_test_subject <- t_tests(df_cleaned_by_subject)
+t_test_trial <- t_tests(df_cleaned_by_trial)
+t_test_both <- t_tests(df_cleaned_by_both)
+t_test_normal <- t_tests(df_gamma)
+```
+
+Let's look at the plots!
+```{r}
+plot_data(t_test_subject, .05, "Subject Level Removal")
+plot_data(t_test_trial, .05, "Trial Level Removal")
+plot_data(t_test_both, .05, "Both")
+plot_data(t_test_normal, .05, "Original Data")
+
+```
+
+The results are similar to the Ex-Gaussian distribution.
+
+## Discussion
+
+When studies are sufficiently well powered (e.g. at 80% power), we see that the different outlier removal methods
+
+# General Discussion
+
+Given that removing outliers at the subject level inflates the false positive rate for the distributions that we have examined, my recommendation is that this should not be done at all. Although there is a slight increase in the likelihood of obtaining a statistically significant result when the study is well-powered, I don't think that this benefit outweighs the costs of false positives. 
+
+
+
+# Future Directions
+
+I tried implementing a method to remove outliers by absolute values (e.g. below 150ms and/or above 2000ms), but these instances were very rare. Removal of data by absolute values is done usually to remove trials that are a result of attentional lapses. However, these datapoints most likely come from a different generating process and thus a different distribution.
+
+In addition, since the Ex-Wald and Gamma distributions are skewed distributions, it would be interesting to look at the effects of removing only the upper or lower outliers (instead of both) at the trial level (it doesn't make sense to only remove participants who are too fast or too slow but not both). 
+
+It could also be worthwhile to look at different cutoff values. It took me 40 minutes just to run this markdown document so I did not play around with different cutoff values and went with 2.5 instead, which I believe is the most widely used cutoff. 
+
